@@ -5,25 +5,23 @@
 
 パターンA: question_text（質問文）だけを与えて、モデルが自由に回答する。
 
+***以下、現在プロンプトにペルソナを追加する等の設定が必要であり：上手くできていません。***
 パターンB: question_text と選択肢（option_a, option_b）を与えて、どちらの選択肢を選ぶかだけを出力させる。
-
-さらに、オプションで回答のコサイン類似度も計算可能です。
 """
-
 import argparse
 import re
+import os
 from datasets import load_dataset
-import json
+
 from unsloth import FastLanguageModel
-from sentence_transformers import SentenceTransformer, util
 
 
 # ------------------------------
-# モデルの読み込み関数
+# モデル読み込み
 # ------------------------------
 def load_model(model_path, max_seq_len=1024):
     """
-    FastLanguageModel を使ってモデルとトークナイザーを読み込む。
+    FastLanguageModel を用いてモデルとトークナイザーを読み込む。
     """
     model, tokenizer = FastLanguageModel.from_pretrained(
         model_name=model_path,
@@ -31,36 +29,20 @@ def load_model(model_path, max_seq_len=1024):
         load_in_4bit=False,
         fast_inference=False,
     )
-    model.eval()  # 推論モードに設定
+    model.eval()  # 推論モード
     return model, tokenizer
 
 
 # ------------------------------
-# プロンプトの組み立て関数
+# シンプルな推論関数
 # ------------------------------
-def build_prompt(messages):
+def infer(model, tokenizer, prompt_text, max_new_tokens=200):
     """
-    system / user 形式のリスト（[{role:..., content:...}, ...]）を
-    ChatGPT風のテキスト形式に変換する。
+    入力となる文字列 (prompt_text) をモデルに与えて、生成テキストを返す。
+    「system: ... + question: ...」等のロールは使わず、ただの文字列連結にしている。
     """
-    return "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in messages])
-
-
-# ------------------------------
-# 推論を実行する関数
-# ------------------------------
-def infer(model, tokenizer, system_prompt, user_message, max_new_tokens=200):
-    """
-    モデルに user_message を与え、生成された回答を文字列として返す。
-    """
-    prompt = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_message},
-    ]
-    input_text = build_prompt(prompt)
-
     # トークナイズ
-    inputs = tokenizer(input_text, return_tensors="pt")
+    inputs = tokenizer(prompt_text, return_tensors="pt")
     for key in inputs:
         inputs[key] = inputs[key].to(model.device)
 
@@ -74,57 +56,67 @@ def infer(model, tokenizer, system_prompt, user_message, max_new_tokens=200):
         pad_token_id=tokenizer.eos_token_id,
     )
 
-    # 出力を文字列にデコード
+    # モデル出力を文字列にデコード
     full_output = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-    # "Assistant:" 以降を抽出する（先頭に出力されている想定の場合）
-    match = re.search(r"Assistant:\s*(.*)", full_output, re.DOTALL)
+    return full_output.strip()
+
+
+# ------------------------------
+# Answer: の直後のテキストを取り出すためのユーティリティ
+# ------------------------------
+def get_text_after_answer(full_text: str) -> str:
+    """
+    大文字・小文字を無視して 'Answer:' 以降のテキストをすべて取り出す。
+    もし 'Answer:' が存在しなければ全文を返す。
+    """
+    # DOTALL オプションにより改行も含めてマッチ
+    match = re.search(r'(?i)answer:\s*(.*)', full_text, re.DOTALL)
     if match:
         return match.group(1).strip()
     else:
-        return full_output.strip()
+        return full_text.strip()
 
 
 # ------------------------------
-# 類似度モデルの読み込み
+# (A) Q/A形式の回答をパース
 # ------------------------------
-def load_similarity_model():
+def parse_qa_answer(raw_answer, system_prompt, question_text):
     """
-    文章同士の類似度を測るための SentenceTransformer モデルを読み込む。
+    1) 'Answer:' より後ろの文字列を取得
+    2) system_prompt および question_text がそのまま含まれていれば削除
+    3) 'assistant:', 'system:', 'question:' などのロール表記も除去
     """
-    return SentenceTransformer("all-mpnet-base-v2")
+    text = get_text_after_answer(raw_answer)
+
+    # 1) system_prompt を除去（含まれていた場合のみ）
+    if system_prompt in text:
+        text = text.replace(system_prompt, "")
+
+    # 2) question_text を除去
+    if question_text in text:
+        text = text.replace(question_text, "")
+
+    # 3) 先頭に出現する "assistant:", "system:", "question:" などを除去（大文字小文字問わず）
+    text = re.sub(r'(?i)^\s*(assistant|system|question):\s*', '', text, flags=re.MULTILINE)
+    
+    return text.strip()
 
 
 # ------------------------------
-# コサイン類似度を計算
+# (B) 選択式回答をパース
 # ------------------------------
-def compute_similarity(text1, text2, similarity_model):
+def parse_optioned_answer(raw_answer, option_a, option_b):
     """
-    2つのテキストのコサイン類似度を計算して数値を返す。
+    1) 'Answer:' より後ろの文字列を取得
+    2) 取得した文字列に 'option_a' があれば option_a, 'option_b' があれば option_b を返す。
+    3) 両方含まれる場合は早く出現した方を優先。
+    4) どちらも無ければ None。
     """
-    if not text1 or not text2:
-        return None
-    emb1 = similarity_model.encode(text1, convert_to_tensor=True)
-    emb2 = similarity_model.encode(text2, convert_to_tensor=True)
-    score = util.cos_sim(emb1, emb2).item()
-    return score
+    # 'Answer:' 後だけを抽出
+    text = get_text_after_answer(raw_answer)
+    text_lower = text.lower()
 
-
-# ------------------------------
-# 選択式回答をパースして "option_a" or "option_b" を抽出
-# ------------------------------
-def parse_optioned_answer(raw_answer, option_a, option_b, similarity_model=None):
-    """
-    モデル回答（raw_answer）が、必ずしも 'option_a' or 'option_b' だけを
-    返さない場合に対応するための関数。
-    1) 文字列に 'option_a' or 'option_b' が含まれていれば、そのまま返す。
-    2) 含まれない場合は、option_a, option_b の内容と raw_answer の類似度を計算し、
-       より近い方を選ぶ。
-    """
-
-    text_lower = raw_answer.lower()
-
-    # 1) 回答文に "option_a" or "option_b" が含まれているか確認
     found_a = "option_a" in text_lower
     found_b = "option_b" in text_lower
 
@@ -133,38 +125,11 @@ def parse_optioned_answer(raw_answer, option_a, option_b, similarity_model=None)
     elif found_b and not found_a:
         return "option_b"
     elif found_a and found_b:
-        # 両方含まれている場合 → どちらかを優先する必要がある
-        # ここでは簡単に先に出現した方を返す例
+        # 両方含まれている場合、先に出現した方を返す
         idx_a = text_lower.index("option_a")
         idx_b = text_lower.index("option_b")
         return "option_a" if idx_a < idx_b else "option_b"
 
-    # 2) "option_a" / "option_b" が回答に含まれていない場合
-    #    → 類似度を使って判定（オプション）
-    if similarity_model is not None:
-        # option_a / option_b のテキスト(例: "大人数と交流する" / "1対1で話す" )
-        # と raw_answer の類似度を比較
-        sim_a = compute_similarity(raw_answer, option_a, similarity_model)
-        sim_b = compute_similarity(raw_answer, option_b, similarity_model)
-
-        # どちらの類似度が高いかで判定
-        if sim_a is not None and sim_b is not None:
-            if sim_a > sim_b:
-                return "option_a"
-            else:
-                return "option_b"
-
-    # 類似度を使わない or どちらもスコア計算できなかった場合は、
-    # 簡易的にキーワードを見る例
-    # 例として "大人数" があれば option_a, "1対1" なら option_b など
-    lower_a = option_a.lower()
-    lower_b = option_b.lower()
-    if any(keyword in text_lower for keyword in ["大人数", "みんなで", "みんなと"]):
-        return "option_a"
-    if any(keyword in text_lower for keyword in ["1対1", "一対一", "一人", "ひとり"]):
-        return "option_b"
-
-    # それでも判断できない場合は None
     return None
 
 
@@ -173,93 +138,81 @@ def parse_optioned_answer(raw_answer, option_a, option_b, similarity_model=None)
 # ------------------------------
 def main(args):
     """
-    新しいMBTI診断用データセットを用いて、2パターンの推論を行う。
-    選択式回答は parse_optioned_answer() で最終的に 'option_a' or 'option_b' を抽出する。
+    MBTI診断データを用いて
+      1) Q/A形式
+      2) 選択式
+    の2種類の推論を行い、最終的な回答だけをJSONに保存する。
     """
 
-    # 1) データセットを読み込む
+    # 1) データセット読込
     ds = load_dataset("DeL-TaiseiOzaki/50_mbti_test")
     train_data = ds["train"]
 
-    # 2) モデルと（必要なら）類似度モデルを読み込む
+    # 2) モデル読込
     model, tokenizer = load_model(args.model_path)
-    similarity_model = load_similarity_model() if args.use_similarity else None
 
-    # システムプロンプト
-    system_prompt = (
-        "あなたの性格どおりに質問に回答してください。\n",
+    # 3) システムプロンプト
+    system_prompt_tuple = (
+        "あなたは質問に回答する優秀なアシスタントです.\n"
         "話し方・価値観・思考パターンを反映した、自然かつ一貫性のある回答をして下さい。\n"
     )
+    system_prompt = "".join(system_prompt_tuple)
 
-    # 結果を格納するリスト
     results = []
 
-    # 3) データをループ
-    for i, sample in enumerate(train_data):
-        if i >= args.num_samples:
-            break
-
+    # 4) 全サンプルを処理
+    for sample in train_data:
         question_id = sample["question_id"]
         question_text = sample["question_text"]
         option_a = sample["option_a"]["text"]
         option_b = sample["option_b"]["text"]
 
-        # --- A) 質問をそのまま投げて自由回答を得る ---
-        user_msg_qa = question_text
-        answer_qa = infer(model, tokenizer, system_prompt, user_msg_qa)
+        # (A) Q/A形式の推論
+        # Qestion: ... Answer: の形式でプロンプトを作る
+        prompt_qa = f"Qestion: {system_prompt}\n\n{question_text} Answer: "
+        raw_answer_qa = infer(model, tokenizer, prompt_qa)
+        print("*"*80)
+        print("RAW QA:", raw_answer_qa)
+        final_qa_answer = parse_qa_answer(raw_answer_qa, system_prompt, question_text)
 
-        # --- B) 選択式: option_a / option_b を与えて答えさせる ---
-        user_msg_optioned = (
-            f"質問: {question_text}\n\n"
-            f"選択肢:\n"
+        # (B) 選択式の推論
+        # Qestion: ... Answer: の形式でプロンプトを作る
+        prompt_optioned = (
+            f"Qestion: {system_prompt}\n\n{question_text}\n\n"
+            "選択肢:\n"
             f"option_a: {option_a}\n"
             f"option_b: {option_b}\n\n"
-            "上記のどちらが正しいか、'option_a' または 'option_b' の文字列のみを出力してください。"
+            "上記のどちらが正しいか、'option_a' または 'option_b' の文字列のみを出力してください。Answer:"
         )
-        raw_answer_optioned = infer(model, tokenizer, system_prompt, user_msg_optioned)
+        raw_answer_optioned = infer(model, tokenizer, prompt_optioned)
+        print("*"*80)
+        print("RAW Option:", raw_answer_optioned)
+        final_optioned = parse_optioned_answer(raw_answer_optioned, option_a, option_b)
 
-        # 選択式回答をパースして "option_a" or "option_b" を特定
-        parsed_option = parse_optioned_answer(raw_answer_optioned, option_a, option_b, similarity_model)
-
-        # （オプション）何かの正解ラベルがあれば類似度を計算
-        # 今回は例としてnullのままにしている
-        reference_answer = None
-        sim_qa = compute_similarity(reference_answer, answer_qa, similarity_model) if reference_answer else None
-        sim_optioned = compute_similarity(reference_answer, raw_answer_optioned, similarity_model) if reference_answer else None
-
-        # 結果を保存
+        # リストにまとめる
         results.append({
             "question_id": question_id,
             "question_text": question_text,
             "option_a": option_a,
             "option_b": option_b,
-            "model_answer_q/a": answer_qa,
-            "similarity_a": sim_qa,
-            "model_answer_optioned_raw": raw_answer_optioned,   # 生の回答（パース前）
-            "model_answer_optioned_parsed": parsed_option,      # "option_a", "option_b", もしくは None
-            "similarity_b": sim_optioned,
+            "model_answer_qa": final_qa_answer,
+            "model_answer_optioned": final_optioned,  # "option_a" / "option_b" / None
         })
 
-    # 4) 出力例：最初の数件をコンソールに表示
-    for item in results[:5]:
-        print("-----")
-        print(f"質問ID: {item['question_id']}")
-        print(f"Q: {item['question_text']}")
-        print(f"自由回答: {item['model_answer_q/a']}")
-        print(f"選択式（生回答）: {item['model_answer_optioned_raw']}")
-        print(f"選択式（パース後）: {item['model_answer_optioned_parsed']}")
-        print("-----")
-
-    with open("./data/results/inference_results.json", "w", encoding="utf-8") as f:
+    # 5) JSON 出力
+    out_file = os.path.join(args.output_path, f"{args.model_name}_parsed_inference_results.json")
+    import json
+    with open(out_file, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
-    print("=> parsed_inference_results.json に結果を保存しました。")
+
+    print(f"=> 推論結果を '{out_file}' に保存しました。")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--model_path", type=str, required=True, help="推論に使用するモデルのパス")
-    parser.add_argument("--num_samples", type=int, default=10, help="テストするデータ数")
-    parser.add_argument("--use_similarity", action="store_true", help="回答のテキスト類似度を計算するか")
+    parser.add_argument("--output_path", type=str, required=True, help="結果の保存先ディレクトリまたはファイルパス")
+    parser.add_argument("--model_name", type=str, required=True, help="出力ファイル名に付与するモデル名")
     args = parser.parse_args()
 
     main(args)
@@ -271,13 +224,18 @@ if __name__ == "__main__":
 
 python run_inference.py \
   --model_path "/root/project/GRPO/output/llmjp-grpo-trained/final_model" \
-  --num_samples 8
+  --output_path "/root/project/GRPO/data/results" \
+  --model_name "only_prm_model"
 
-  
-類似度を有効にする場合：
-python run_inference.py \
+------------------------------------------------------------------------------------ 
+python run_mbti_inference.py \
   --model_path "/path/to/your/model" \
-  --num_samples 8 \
-  --use_similarity
+  --output_path "/some/output/folder" \
+  --model_name "my-model"
+実行すると、以下のように結果ファイルが出力されます。
+
+swift
+Copy
+/some/output/folder/my-model_parsed_inference_results.json
 
 """
