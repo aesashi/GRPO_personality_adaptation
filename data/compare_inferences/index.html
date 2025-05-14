@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>回答比較ビューア</title>
+  <style>
+    body {
+      font-family: sans-serif;
+      background-color: #f4f4f4;
+      padding: 20px;
+    }
+
+    h1 {
+      text-align: center;
+    }
+
+    .question-block {
+      background: white;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 20px;
+      box-shadow: 0 0 5px rgba(0,0,0,0.1);
+    }
+
+    .question-title {
+      font-weight: bold;
+      margin-bottom: 10px;
+    }
+
+    .section {
+      margin-top: 10px;
+      padding: 10px;
+      border-left: 4px solid #ccc;
+      background: #fafafa;
+    }
+
+    .model-answer {
+      margin-top: 10px;
+      padding: 10px;
+      border-left: 4px solid #4285f4;
+      background: #fff;
+    }
+
+    .similarity {
+      font-size: 0.9rem;
+      color: #333;
+      background: #e0f0ff;
+      display: inline-block;
+      padding: 2px 6px;
+      margin-left: 8px;
+      border-radius: 4px;
+    }
+
+    pre {
+      white-space: pre-wrap;
+      margin: 0;
+    }
+  </style>
+</head>
+<body>
+
+<h1>回答比較ビューア</h1>
+<div id="app">読み込み中...</div>
+
+<script>
+  const JSON_FILE = "answers_INTJ_nemotron_with_results.json"; // ← ファイル名に注意
+
+  fetch(JSON_FILE)
+    .then(res => res.json())
+    .then(json => {
+      const data = Array.isArray(json) ? json : json.data;
+      const app = document.getElementById("app");
+      app.innerHTML = "";
+
+      data.forEach(entry => {
+        const block = document.createElement("div");
+        block.className = "question-block";
+
+        const title = document.createElement("div");
+        title.className = "question-title";
+        title.textContent = `Q${entry.question_id}: ${entry.generated_question}`;
+        block.appendChild(title);
+
+        // 1. 参考回答（answer）
+        const refSection = document.createElement("div");
+        refSection.className = "section";
+        refSection.innerHTML = `<strong>Ground Truth - Nemotron_SF:</strong><br><pre>${entry.answer}</pre>`;
+        block.appendChild(refSection);
+
+        // 2. ベースラインモデル（llmjp-13b_instruct）
+        const baseKey = "llmjp-13b_instruct";
+        const baseSimKey = baseKey + "_similarity";
+        const baseOutput = entry[baseKey];
+
+        if (baseOutput) {
+          const baseDiv = document.createElement("div");
+          baseDiv.className = "model-answer";
+
+          const label = document.createElement("div");
+          label.innerHTML = `<strong>ベースライン: ${baseKey}</strong>` +
+            (entry[baseSimKey] != null
+              ? `<span class="similarity">類似度: ${entry[baseSimKey].toFixed(3)}</span>`
+              : "");
+
+          const content = document.createElement("pre");
+          content.textContent = baseOutput;
+
+          baseDiv.appendChild(label);
+          baseDiv.appendChild(content);
+          block.appendChild(baseDiv);
+        }
+
+        // 3. その他モデル（_inferenceで終わるがベースラインは除く）
+        const otherKeys = Object.keys(entry)
+          .filter(k => k.endsWith("_inference") && k !== baseKey);
+
+        otherKeys.forEach(modelKey => {
+          const simKey = modelKey + "_similarity";
+          const modelOutput = entry[modelKey];
+          const similarity = entry[simKey];
+
+          if (!modelOutput) return;
+
+          const modelDiv = document.createElement("div");
+          modelDiv.className = "model-answer";
+
+          const label = document.createElement("div");
+          label.innerHTML = `<strong>${modelKey}</strong>` +
+            (similarity != null ? `<span class="similarity">類似度: ${similarity.toFixed(3)}</span>` : "");
+
+          const content = document.createElement("pre");
+          content.textContent = modelOutput;
+
+          modelDiv.appendChild(label);
+          modelDiv.appendChild(content);
+          block.appendChild(modelDiv);
+        });
+
+        app.appendChild(block);
+      });
+    })
+    .catch(err => {
+      console.error("JSON 読み込み失敗:", err);
+      document.getElementById("app").textContent = "データの読み込みに失敗しました。";
+    });
+</script>
+
+</body>
+</html>
