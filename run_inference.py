@@ -200,7 +200,7 @@ def main(args):
         })
 
     # 5) JSON 出力
-    out_file = os.path.join(args.output_path, f"{args.model_name}_parsed_inference_results.json")
+    out_file = os.path.join(args.output_path, f"{args.model_name}_inference_results.json")
     import json
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
@@ -223,9 +223,9 @@ if __name__ == "__main__":
 ✅ 実行例
 
 python run_inference.py \
-  --model_path "/root/project/GRPO/output/llmjp-grpo-trained/final_model" \
+  --model_path "/root/project/GRPO/output/cocine_sim-grpo-trained-INTJ/final_model" \
   --output_path "/root/project/GRPO/data/results" \
-  --model_name "only_prm_model"
+  --model_name "only_consine-sim_model"
 
 ------------------------------------------------------------------------------------ 
 python run_mbti_inference.py \

@@ -79,7 +79,7 @@ def consine_sim_reward(prompts, completions, answer, **kwargs):
     0〜3のスケールでスコアを与える関数。
     """
     # ユーザーの質問文を取得
-    question = prompts[0][-1]["content"]
+    # question = prompts[0][-1]["content"]
 
     # モデルの出力（completion）をテキストに変換
     responses = [completion[0]["content"] for completion in completions]

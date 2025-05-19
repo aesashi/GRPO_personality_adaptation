@@ -84,7 +84,7 @@ def main():
     # コマンドライン引数の取得
     args = parse_args()
     wandb.init(
-        project="GRPO-ENTJ-LLM-as-judge",          
+        project="GRPO-INTJ-Cosine-Sim-and-LLM-as-Judge",          
         config=vars(args)                
     )
     # モデルとトークナイザーの読み込みと初期化
@@ -144,7 +144,7 @@ def main():
         model=model,
         processing_class=tokenizer,
         reward_funcs=[
-            LLM_as_judge_reward,
+            consine_sim_reward,
         ],
         args=training_args,
         train_dataset=dataset,
